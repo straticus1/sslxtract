@@ -1,0 +1,21 @@
+{
+  "host": "0.0.0.0",
+  "port": 8443,
+  "ssl_cert": "server.crt",
+  "ssl_key": "server.key",
+  "storage_dir": "./certs",
+  "timeout": 10.0,
+  "allowed_hosts": null,
+  "blocked_hosts": [
+    "localhost",
+    "127.0.0.1",
+    "10.0.0.0/8",
+    "192.168.0.0/16"
+  ],
+  "require_auth": false,
+  "api_keys": [
+    "your-api-key-here"
+  ],
+  "max_concurrent": 10,
+  "log_requests": true
+}
