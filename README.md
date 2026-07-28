@@ -20,7 +20,14 @@ cd sslxtract
 chmod +x sslxtract.py ssl_extract_server.py
 ```
 
-Requirements: Python 3.7+, OpenSSL (for certificate parsing)
+Requirements: Python 3.7+ and OpenSSL (for certificate parsing).
+
+Install the Python dependencies for the DNS extractor, monitor, and optional
+CA-chain verification:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
 
 ## CLI Usage
 

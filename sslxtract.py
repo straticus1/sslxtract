@@ -22,6 +22,9 @@ from datetime import datetime
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 import concurrent.futures
+import json
+
+from sslutils import parse_target, BufferedSocket
 
 # ANSI colors for terminal output
 class Colors:
@@ -103,104 +106,127 @@ class SSLExtractor:
 
     def smtp_starttls(self, host: str, port: int) -> Tuple[bytes, List[bytes]]:
         """Extract certificate via SMTP STARTTLS."""
-        with socket.create_connection((host, port), timeout=self.timeout) as sock:
-            sock.settimeout(self.timeout)
+        with socket.create_connection((host, port), timeout=self.timeout) as raw_sock:
+            raw_sock.settimeout(self.timeout)
+            sock = BufferedSocket(raw_sock)
 
             # Read banner
-            banner = sock.recv(1024)
+            banner = sock.readline()
             if not banner.startswith(b'220'):
                 raise ConnectionError(f"SMTP banner error: {banner.decode(errors='ignore')}")
 
             # Send EHLO
             sock.sendall(b'EHLO sslxtract\r\n')
-            response = b''
+            
+            # Read EHLO response
+            starttls_supported = False
             while True:
-                chunk = sock.recv(1024)
-                response += chunk
-                if b'\r\n' in chunk and (b'250 ' in response or b'250-' not in response.split(b'\r\n')[-2]):
+                line = sock.readline()
+                if not line:
                     break
+                    
+                line_str = line.decode(errors='ignore').upper()
+                if 'STARTTLS' in line_str:
+                    starttls_supported = True
+                    
+                # Check for end of response (250 <space> or just 250)
+                if line.startswith(b'250 '):
+                    break
+                if not line.startswith(b'250-'):
+                    # Unexpected response code
+                    raise ConnectionError(f"EHLO failed: {line.decode(errors='ignore')}")
 
-            if b'250' not in response:
-                raise ConnectionError(f"EHLO failed: {response.decode(errors='ignore')}")
+            if not starttls_supported:
+                # Some servers support it but don't advertise it to unknown clients, try anyway
+                pass
 
             # Send STARTTLS
             sock.sendall(b'STARTTLS\r\n')
-            response = sock.recv(1024)
+            response = sock.readline()
             if not response.startswith(b'220'):
                 raise ConnectionError(f"STARTTLS failed: {response.decode(errors='ignore')}")
 
             # Upgrade to TLS
             ctx = self.create_ssl_context()
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            # We must use the raw socket for wrap_socket
+            with ctx.wrap_socket(raw_sock, server_hostname=host) as ssock:
                 der_cert = ssock.getpeercert(binary_form=True)
                 chain = [der_cert] if der_cert else []
                 return der_cert, chain
 
     def imap_starttls(self, host: str, port: int) -> Tuple[bytes, List[bytes]]:
         """Extract certificate via IMAP STARTTLS."""
-        with socket.create_connection((host, port), timeout=self.timeout) as sock:
-            sock.settimeout(self.timeout)
+        with socket.create_connection((host, port), timeout=self.timeout) as raw_sock:
+            raw_sock.settimeout(self.timeout)
+            sock = BufferedSocket(raw_sock)
 
             # Read banner
-            banner = sock.recv(1024)
+            banner = sock.readline()
             if b'OK' not in banner and b'*' not in banner:
                 raise ConnectionError(f"IMAP banner error: {banner.decode(errors='ignore')}")
 
             # Send STARTTLS
             sock.sendall(b'a001 STARTTLS\r\n')
-            response = sock.recv(1024)
-            if b'OK' not in response:
-                raise ConnectionError(f"STARTTLS failed: {response.decode(errors='ignore')}")
+            
+            # Read response
+            while True:
+                line = sock.readline()
+                if b'a001 OK' in line:
+                    break
+                if b'a001 NO' in line or b'a001 BAD' in line:
+                    raise ConnectionError(f"STARTTLS failed: {line.decode(errors='ignore')}")
 
             # Upgrade to TLS
             ctx = self.create_ssl_context()
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            with ctx.wrap_socket(raw_sock, server_hostname=host) as ssock:
                 der_cert = ssock.getpeercert(binary_form=True)
                 chain = [der_cert] if der_cert else []
                 return der_cert, chain
 
     def pop3_starttls(self, host: str, port: int) -> Tuple[bytes, List[bytes]]:
         """Extract certificate via POP3 STARTTLS."""
-        with socket.create_connection((host, port), timeout=self.timeout) as sock:
-            sock.settimeout(self.timeout)
+        with socket.create_connection((host, port), timeout=self.timeout) as raw_sock:
+            raw_sock.settimeout(self.timeout)
+            sock = BufferedSocket(raw_sock)
 
             # Read banner
-            banner = sock.recv(1024)
+            banner = sock.readline()
             if not banner.startswith(b'+OK'):
                 raise ConnectionError(f"POP3 banner error: {banner.decode(errors='ignore')}")
 
             # Send STLS
             sock.sendall(b'STLS\r\n')
-            response = sock.recv(1024)
+            response = sock.readline()
             if not response.startswith(b'+OK'):
                 raise ConnectionError(f"STLS failed: {response.decode(errors='ignore')}")
 
             # Upgrade to TLS
             ctx = self.create_ssl_context()
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            with ctx.wrap_socket(raw_sock, server_hostname=host) as ssock:
                 der_cert = ssock.getpeercert(binary_form=True)
                 chain = [der_cert] if der_cert else []
                 return der_cert, chain
 
     def ftp_starttls(self, host: str, port: int) -> Tuple[bytes, List[bytes]]:
         """Extract certificate via FTP AUTH TLS."""
-        with socket.create_connection((host, port), timeout=self.timeout) as sock:
-            sock.settimeout(self.timeout)
+        with socket.create_connection((host, port), timeout=self.timeout) as raw_sock:
+            raw_sock.settimeout(self.timeout)
+            sock = BufferedSocket(raw_sock)
 
             # Read banner
-            banner = sock.recv(1024)
+            banner = sock.readline()
             if not banner.startswith(b'220'):
                 raise ConnectionError(f"FTP banner error: {banner.decode(errors='ignore')}")
 
             # Send AUTH TLS
             sock.sendall(b'AUTH TLS\r\n')
-            response = sock.recv(1024)
+            response = sock.readline()
             if not response.startswith(b'234'):
                 raise ConnectionError(f"AUTH TLS failed: {response.decode(errors='ignore')}")
 
             # Upgrade to TLS
             ctx = self.create_ssl_context()
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            with ctx.wrap_socket(raw_sock, server_hostname=host) as ssock:
                 der_cert = ssock.getpeercert(binary_form=True)
                 chain = [der_cert] if der_cert else []
                 return der_cert, chain
@@ -299,30 +325,17 @@ def der_to_pem(der_cert: bytes) -> str:
     return "-----BEGIN CERTIFICATE-----\n" + "\n".join(lines) + "\n-----END CERTIFICATE-----\n"
 
 
-def parse_target(target: str) -> Tuple[str, int, Optional[str]]:
-    """Parse target specification into host, port, protocol."""
-    # Handle URL-style input
-    if '://' in target:
-        parsed = urlparse(target)
-        protocol = parsed.scheme.lower()
-        host = parsed.hostname or parsed.path
-        port = parsed.port or PROTOCOL_PORTS.get(protocol, 443)
-        return host, port, protocol
+def parse_target_legacy(target: str) -> Tuple[str, int, Optional[str]]:
+    """Legacy parser wrapper."""
+    try:
+        host, port, proto = parse_target(target)
+        return host, port, proto
+    except ValueError:
+        # Fallback behavior or re-raise
+        return target, 443, None
 
-    # Handle host:port format
-    if ':' in target:
-        host, port_str = target.rsplit(':', 1)
-        try:
-            port = int(port_str)
-        except ValueError:
-            # Might be IPv6 without port
-            host = target
-            port = 443
-    else:
-        host = target
-        port = 443
-
-    return host, port, None
+# Keep old name if needed by imports but redirect to new one
+parse_target_impl = parse_target
 
 
 def get_cert_info(der_cert: bytes, verbose: bool = False) -> dict:
@@ -806,24 +819,47 @@ Examples:
                     f.write(output)
                 if not args.quiet:
                     print(f"{color('Saved to', Colors.GREEN)} {args.save}", file=sys.stderr)
-            elif not args.scan:
-                # Output to stdout (unless in scan mode)
+            elif not args.scan and not args.json:
+                # Output to stdout (unless in scan/json mode)
                 if args.der:
                     sys.stdout.buffer.write(output)
                 else:
                     print(output, end='')
 
-            if not args.quiet:
+            # Single Target JSON output
+            if args.json:
+                info = get_cert_info(der_cert)
+                json_output = {
+                    'target': target,
+                    'host': host,
+                    'port': port,
+                    'protocol': protocol,
+                    'success': True,
+                    'pem': der_to_pem(der_cert),
+                    'info': info
+                }
+                print(json.dumps(json_output, indent=2))
+
+            if not args.quiet and not args.json:
                 print(f"{color('Success!', Colors.GREEN)}", file=sys.stderr)
 
         except socket.timeout:
-            print(f"{color('Error:', Colors.RED)} Connection timed out", file=sys.stderr)
+            if args.json:
+                print(json.dumps({'target': target, 'success': False, 'error': 'Connection timed out'}), indent=2)
+            else:
+                print(f"{color('Error:', Colors.RED)} Connection timed out", file=sys.stderr)
             sys.exit(1)
         except ConnectionRefusedError:
-            print(f"{color('Error:', Colors.RED)} Connection refused", file=sys.stderr)
+            if args.json:
+                print(json.dumps({'target': target, 'success': False, 'error': 'Connection refused'}), indent=2)
+            else:
+                print(f"{color('Error:', Colors.RED)} Connection refused", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
-            print(f"{color('Error:', Colors.RED)} {e}", file=sys.stderr)
+            if args.json:
+                print(json.dumps({'target': target, 'success': False, 'error': str(e)}), indent=2)
+            else:
+                print(f"{color('Error:', Colors.RED)} {e}", file=sys.stderr)
             sys.exit(1)
 
     # Multiple targets mode

@@ -14,6 +14,8 @@ import os
 import ssl
 import sys
 import hashlib
+import hmac
+import ipaddress
 import threading
 import logging
 import socket
@@ -26,11 +28,13 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 # Import the extractor from sslxtract
-from sslxtract import SSLExtractor, der_to_pem, get_cert_info, parse_target
+from sslxtract import SSLExtractor, der_to_pem, get_cert_info
+from sslutils import resolve_securely, is_ip_allowed, parse_target
 
 try:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, padding, rsa
     from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID
     from cryptography.hazmat.backends import default_backend
     import certifi
@@ -61,6 +65,10 @@ class Config:
         self.blocked_hosts: list = []
         self.require_auth: bool = False
         self.api_keys: list = []
+        # mTLS settings
+        self.client_ca: Optional[str] = None
+        self.verify_client: bool = False
+        
         self.max_concurrent: int = 10
         self.log_requests: bool = True
 
@@ -110,6 +118,8 @@ class Config:
             'blocked_hosts': self.blocked_hosts,
             'require_auth': self.require_auth,
             'api_keys': self.api_keys,
+            'client_ca': self.client_ca,
+            'verify_client': self.verify_client,
             'max_concurrent': self.max_concurrent,
             'log_requests': self.log_requests,
             'self_signed_cert': self.self_signed_cert,
@@ -394,8 +404,10 @@ class CAChainVerifier:
         for depth in range(self.max_depth):
             # Check if current cert is in our trusted CA store
             subject_bytes = current.subject.public_bytes()
-            if subject_bytes in self._ca_certs:
-                # Found trusted root!
+            trusted_root = self._ca_certs.get(subject_bytes)
+            if trusted_root and current.fingerprint(hashes.SHA256()) == trusted_root.fingerprint(hashes.SHA256()):
+                # Found the exact trusted root, not merely another certificate
+                # with the same subject name.
                 return True, ""
 
             # Check if self-signed (potential root)
@@ -420,12 +432,34 @@ class CAChainVerifier:
             if not issuer:
                 return False, f"Cannot find issuer for: {current.subject.rfc4514_string()}"
 
-            # TODO: Actually verify the signature if cryptography supports it
-            # For now, we just verify the chain links exist
+            if not self._is_ca_cert(issuer):
+                return False, f"Issuer is not a CA: {issuer.subject.rfc4514_string()}"
+            try:
+                self._verify_certificate_signature(current, issuer)
+            except Exception as e:
+                return False, f"Invalid certificate signature: {e}"
 
             current = issuer
 
         return False, f"Chain depth exceeded maximum ({self.max_depth})"
+
+    @staticmethod
+    def _verify_certificate_signature(cert: 'x509.Certificate', issuer: 'x509.Certificate') -> None:
+        """Verify a certificate was signed by its claimed issuer."""
+        public_key = issuer.public_key()
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(cert.signature, cert.tbs_certificate_bytes,
+                              padding.PKCS1v15(), cert.signature_hash_algorithm)
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(cert.signature, cert.tbs_certificate_bytes,
+                              ec.ECDSA(cert.signature_hash_algorithm))
+        elif isinstance(public_key, dsa.DSAPublicKey):
+            public_key.verify(cert.signature, cert.tbs_certificate_bytes,
+                              cert.signature_hash_algorithm)
+        elif isinstance(public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+            public_key.verify(cert.signature, cert.tbs_certificate_bytes)
+        else:
+            raise ValueError(f"Unsupported issuer key type: {type(public_key).__name__}")
 
     def should_reject(self, verification_result: dict) -> bool:
         """
@@ -451,6 +485,20 @@ class SSLExtractHandler(BaseHTTPRequestHandler):
     store: CertificateStore = None
     semaphore: threading.Semaphore = None
     chain_verifier: CAChainVerifier = None
+    
+    # Metrics
+    metrics = {
+        'requests_total': 0,
+        'requests_success': 0,
+        'requests_failed': 0,
+        'certs_stored': 0
+    }
+    _metrics_lock = threading.Lock()
+
+    @classmethod
+    def inc_metric(cls, name):
+        with cls._metrics_lock:
+            cls.metrics[name] += 1
 
     def log_message(self, format, *args):
         """Override to use our logger."""
@@ -478,27 +526,35 @@ class SSLExtractHandler(BaseHTTPRequestHandler):
         auth = self.headers.get('Authorization', '')
         if auth.startswith('Bearer '):
             token = auth[7:]
-            return token in self.config.api_keys
+            return any(hmac.compare_digest(token, key) for key in self.config.api_keys)
 
         # Also check query param
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         api_key = params.get('api_key', [None])[0]
-        return api_key in self.config.api_keys
+        return api_key is not None and any(
+            hmac.compare_digest(api_key, key) for key in self.config.api_keys
+        )
 
     def _check_host_allowed(self, host: str) -> bool:
         """Check if target host is allowed."""
-        # Check blocked list
-        for blocked in self.config.blocked_hosts:
-            if blocked in host:
+        host = host.rstrip('.').lower()
+
+        def matches(rule: str) -> bool:
+            rule = rule.rstrip('.').lower()
+            if not rule:
                 return False
+            try:
+                return ipaddress.ip_address(host) in ipaddress.ip_network(rule, strict=False)
+            except ValueError:
+                return host == rule or host.endswith('.' + rule)
+
+        if any(matches(blocked) for blocked in self.config.blocked_hosts):
+            return False
 
         # Check allowed list (if configured)
         if self.config.allowed_hosts:
-            for allowed in self.config.allowed_hosts:
-                if allowed in host:
-                    return True
-            return False
+            return any(matches(allowed) for allowed in self.config.allowed_hosts)
 
         return True
 
@@ -511,8 +567,13 @@ class SSLExtractHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        
+        self.inc_metric('requests_total')
 
-        if path == '/health':
+        if path == '/metrics':
+            self._send_metrics()
+            
+        elif path == '/health':
             self._send_json({'status': 'ok', 'service': 'ssl-extract-server'})
 
         elif path == '/extract':
@@ -556,12 +617,43 @@ class SSLExtractHandler(BaseHTTPRequestHandler):
         else:
             self._send_error("Not found", 404)
 
+    def _send_metrics(self):
+        """Send Prometheus metrics."""
+        metrics_output = []
+        metrics_output.append("# HELP sslxtract_requests_total Total requests")
+        metrics_output.append("# TYPE sslxtract_requests_total counter")
+        metrics_output.append(f"sslxtract_requests_total {self.metrics['requests_total']}")
+        
+        metrics_output.append("# HELP sslxtract_requests_success Successful extractions")
+        metrics_output.append("# TYPE sslxtract_requests_success counter")
+        metrics_output.append(f"sslxtract_requests_success {self.metrics['requests_success']}")
+        
+        metrics_output.append("# HELP sslxtract_requests_failed Failed extractions")
+        metrics_output.append("# TYPE sslxtract_requests_failed counter")
+        metrics_output.append(f"sslxtract_requests_failed {self.metrics['requests_failed']}")
+        
+        # Current cert count
+        certs = self.store.list_all()
+        metrics_output.append("# HELP sslxtract_certs_stored Total certificates in storage")
+        metrics_output.append("# TYPE sslxtract_certs_stored gauge")
+        metrics_output.append(f"sslxtract_certs_stored {len(certs)}")
+        
+        output = '\n'.join(metrics_output) + '\n'
+        
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; version=0.0.4')
+        self.send_header('Content-Length', len(output))
+        self.end_headers()
+        self.wfile.write(output.encode())
+
     def do_POST(self):
         """Handle POST requests."""
         if not self._check_auth():
             self._send_error("Unauthorized", 401)
             return
 
+        self.inc_metric('requests_total')
+        
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -641,31 +733,59 @@ class SSLExtractHandler(BaseHTTPRequestHandler):
             result = self._do_extract(target, save=save, verbose=verbose,
                                      protocol=protocol, servername=servername)
             self._send_json({'success': True, **result})
+            self.inc_metric('requests_success')
         except ValueError as e:
             self._send_error(str(e), 400)
+            self.inc_metric('requests_failed')
         except Exception as e:
             logger.exception(f"Error extracting cert from {target}")
             self._send_error(f"Extraction failed: {e}", 500)
+            self.inc_metric('requests_failed')
 
     def _do_extract(self, target: str, save: bool = False, verbose: bool = False,
                     protocol: str = None, servername: str = None,
                     verify_chain: bool = None) -> dict:
         """Perform certificate extraction."""
-        # Parse target
-        host, port, detected_protocol = parse_target(target)
+        # Parse target using robust parser
+        try:
+            host, port, detected_protocol = parse_target(target)
+        except ValueError as e:
+            raise ValueError(f"Invalid target: {e}")
+            
         protocol = protocol or detected_protocol
 
-        # Check if host is allowed
-        if not self._check_host_allowed(host):
-            raise ValueError(f"Host '{host}' is not allowed")
+        # SSRF Protection: Resolve hostname securely to an allowed IP
+        try:
+            resolved_ip = resolve_securely(host)
+            # Use the resolved IP for connection to prevent DNS rebinding
+            connect_host = resolved_ip 
+            
+            # Allow override for connection but keep original host for SNI
+            # Check if host is allowed by config policy (on top of private IP check)
+            if not self._check_host_allowed(host):
+                 raise ValueError(f"Host '{host}' is not allowed by policy")
+                 
+        except ValueError as e:
+             raise ValueError(f"Security check failed: {e}")
 
         # Acquire semaphore for rate limiting
         if not self.semaphore.acquire(timeout=30):
             raise ValueError("Server busy, try again later")
 
         try:
-            # Extract certificate
-            der_cert, chain = self.extractor.extract(host, port, protocol, servername)
+            # Extract certificate using the resolved IP address to prevent SSRF
+            # We pass the original hostname as servername for SNI
+            
+            # NOTE: SSLExtractor needs to support connect_host vs sni_host separation
+            # Since we didn't modify SSLExtractor signature yet, we will rely on 
+            # resolve_securely check. However, for full DNS rebinding protection,
+            # we should connect to the IP. 
+            # Given SSLExtractor uses socket.create_connection((host, port)),
+            # we can pass the IP as 'host' and the original hostname as 'servername' (SNI).
+            
+            effective_sni = servername or host
+            
+            der_cert, chain = self.extractor.extract(connect_host, port, protocol, effective_sni)
 
             if not der_cert:
                 raise ValueError("No certificate received")
@@ -677,6 +797,7 @@ class SSLExtractHandler(BaseHTTPRequestHandler):
             result = {
                 'target': target,
                 'host': host,
+                'resolved_ip': resolved_ip,
                 'port': port,
                 'protocol': protocol,
                 'pem': pem,
@@ -1127,6 +1248,7 @@ API Endpoints:
     parser.add_argument('--port', type=int, help='Port number (default: 8443)')
     parser.add_argument('--cert', help='SSL certificate file')
     parser.add_argument('--key', help='SSL key file')
+    parser.add_argument('--client-ca', help='Client CA certificate file for mTLS')
     parser.add_argument('--combined-pem', metavar='FILE',
                         help='Combined cert+key PEM file (will split for use)')
     parser.add_argument('--no-ssl', action='store_true', help='Run without SSL (HTTP only)')
@@ -1190,6 +1312,10 @@ API Endpoints:
         config.ssl_key = args.key
     if args.storage:
         config.storage_dir = args.storage
+    if args.client_ca:
+        config.client_ca = args.client_ca
+        config.verify_client = True
+        
     if args.verify_ca_chains:
         config.verify_public_ca_chains = args.verify_ca_chains
     if args.verify_ca_depth:
@@ -1302,6 +1428,16 @@ API Endpoints:
 
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(config.ssl_cert, config.ssl_key)
+        
+        # Setup mTLS if configured
+        if config.verify_client and config.client_ca:
+            if not os.path.exists(config.client_ca):
+                logger.error(f"Client CA file not found: {config.client_ca}")
+                sys.exit(1)
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.load_verify_locations(cafile=config.client_ca)
+            logger.info(f"mTLS enabled using CA: {config.client_ca}")
+            
         server.socket = context.wrap_socket(server.socket, server_side=True)
         scheme = "https"
     else:

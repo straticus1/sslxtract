@@ -23,6 +23,7 @@ import subprocess
 import sys
 import urllib.request
 import urllib.parse
+import shutil
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -477,6 +478,37 @@ def cmd_ecparam(args):
     write_output(stdout, args.outfile, is_text=is_text)
 
 
+def cmd_jks(args):
+    """Handle Java KeyStore operations."""
+    if not shutil.which('keytool'):
+        print("Error: 'keytool' not found in PATH (JDK required)", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = ['keytool', '-list', '-v']
+    
+    if args.infile:
+        cmd.extend(['-keystore', args.infile])
+    
+    if args.storepass:
+        cmd.extend(['-storepass', args.storepass])
+    else:
+        # Keytool prompts interactively if no password, which is fine
+        pass
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error listing keystore: {result.stdout}\n{result.stderr}", file=sys.stderr)
+            sys.exit(1)
+            
+        print(result.stdout)
+        
+        # JSON output parsing could go here in future
+        
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
 def main():
     parser = argparse.ArgumentParser(
         description='SSL/TLS key and certificate format conversion utility',
@@ -491,18 +523,28 @@ Examples:
   %(prog)s ecparam -list_curves
   %(prog)s ct -in cert.pem                    # Search CT logs for certificate
   %(prog)s ct -domain example.com             # Search CT logs by domain
-  %(prog)s ct -domain "%.example.com"         # Search with wildcard
+  %(prog)s ct -domain "%%.example.com"        # Search with wildcard
+  %(prog)s jks -in keystore.jks -storepass changeit  # List JKS contents
 
 Supported formats:
   pem      - Base64 encoded with headers (default)
   der      - Binary DER encoding
   p7b      - PKCS#7/P7B format
   pkcs12   - PKCS#12/PFX format (certificates)
+  jks      - Java KeyStore (requires keytool)
   auto     - Auto-detect input format
 """
     )
 
     subparsers = parser.add_subparsers(dest='command', help='Command')
+
+    # ... (existing parsers) ...
+
+    # jks subcommand
+    jks_parser = subparsers.add_parser('jks', help='Java KeyStore operations')
+    jks_parser.add_argument('-in', dest='infile', required=True, help='Input JKS file')
+    jks_parser.add_argument('-storepass', help='Keystore password')
+    jks_parser.set_defaults(func=cmd_jks)
 
     # x509 subcommand
     x509_parser = subparsers.add_parser('x509', help='X.509 certificate operations')

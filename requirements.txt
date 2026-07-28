@@ -1,0 +1,5 @@
+certifi>=2023.7.22
+cryptography>=3.4
+dnspython>=2.0
+PyYAML>=5.4
+requests>=2.25
